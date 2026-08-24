@@ -1,6 +1,18 @@
 // ============================================================
 // KeyCRM MCP Server для Cloudflare Workers
-// Версія 8.4 — закрито відкритий ендпоінт.
+// Версія 8.5 — OAuth 2.1, секрет більше не потрібен в URL.
+//
+// ЗМІНИ ПРОТИ v8.4 (безпека; логіка тулів не чіпалась):
+//   [НОВЕ] справжній OAuth 2.1 з PKCE — саме те, чого клієнт Claude шукав сам,
+//          отримуючи 401. Ендпоінти: /.well-known/oauth-protected-resource,
+//          /.well-known/oauth-authorization-server, /register, /authorize, /token.
+//          Тепер в URL конектора лишається чистий /mcp, а секрет вводиться один
+//          раз на екрані входу й далі живе як токен на стороні клієнта.
+//   [НОВЕ] стан НЕ зберігається ніде: client_id, код і токен — блоби, підписані
+//          HMAC-SHA256 на MCP_SHARED_SECRET. Жодних KV/D1/Durable Objects.
+//   [ФІКС] /mcp знову віддає 401, але тепер з WWW-Authenticate на метадані —
+//          у v8.4 стояв 403, бо OAuth не було й 401 вів клієнта в нікуди.
+//   [ЗБЕРЕЖЕНО] X-MCP-Key і /mcp/<секрет> працюють як раніше — для curl і мосту.
 //
 // ЗМІНИ ПРОТИ v8.3 (безпека; логіка тулів не чіпалась):
 //   [ФІКС] /mcp більше не відкритий. Був доступний будь-кому, хто знає URL,
@@ -56,11 +68,25 @@ export default {
     if (request.method === 'OPTIONS') return corsResponse(null, 204);
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/') {
-      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.1 running ✓' }), 200);
+      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.5 running ✓' }), 200);
     }
-    // /mcp або /mcp/<секрет> — друге для клієнтів, де можна задати лише URL.
+
+    // OAuth 2.1 — те, що клієнт Claude шукає сам, отримавши 401 від /mcp.
+    if (request.method === 'GET' && url.pathname === '/.well-known/oauth-protected-resource') {
+      return oauthProtectedResource(url);
+    }
+    if (request.method === 'GET' && url.pathname === '/.well-known/oauth-authorization-server') {
+      return oauthServerMetadata(url);
+    }
+    if (request.method === 'POST' && url.pathname === '/register') return oauthRegister(request, url, env);
+    if (url.pathname === '/authorize' && (request.method === 'GET' || request.method === 'POST')) {
+      return oauthAuthorize(request, url, env);
+    }
+    if (request.method === 'POST' && url.pathname === '/token') return oauthToken(request, url, env);
+
+    // /mcp або /mcp/<секрет> — друге лишається для curl і keycrm_bridge.py.
     if (request.method === 'POST' && (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/'))) {
-      if (!isAuthorized(request, url, env)) return unauthorized(env);
+      if (!await isAuthorized(request, url, env)) return unauthorized(env, url);
       return handleMCP(request, env);
     }
     return corsResponse(JSON.stringify({ error: 'Not found' }), 404);
@@ -80,7 +106,7 @@ export default {
 // ВАЖЛИВО: секрет має бути ASCII. HTTP-заголовок фізично не може нести
 // символи поза 0-255, тож кирилиця у секреті зламає варіанти 1 і 2.
 
-function isAuthorized(request, url, env) {
+async function isAuthorized(request, url, env) {
   const expected = env.MCP_SHARED_SECRET;
   if (!expected) return false;
 
@@ -88,7 +114,12 @@ function isAuthorized(request, url, env) {
   if (headerKey) return safeEqual(headerKey, expected);
 
   const auth = request.headers.get('Authorization') || '';
-  if (auth.startsWith('Bearer ')) return safeEqual(auth.slice(7), expected);
+  if (auth.startsWith('Bearer ')) {
+    const bearer = auth.slice(7);
+    // Спершу OAuth-токен, виданий нашим /token; якщо ні — сирий спільний секрет.
+    if (await verifyBlob(bearer, expected, 'tok')) return true;
+    return safeEqual(bearer, expected);
+  }
 
   if (url.pathname.startsWith('/mcp/')) {
     return safeEqual(decodeURIComponent(url.pathname.slice(5)), expected);
@@ -107,17 +138,226 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-function unauthorized(env) {
-  const reason = env.MCP_SHARED_SECRET
-    ? 'Forbidden: missing or invalid MCP secret'
-    : 'Server misconfigured: MCP_SHARED_SECRET is not set';
-  // 403, а НЕ 401. У MCP 401 — це протокольне запрошення пройти OAuth: клієнт
-  // піде шукати /.well-known/oauth-* , не знайде, і покаже користувачу помилку
-  // реєстрації в неіснуючому "sign-in service". Ми на спільному секреті, OAuth
-  // не буде — тож кажемо прямо "не пущу", без запрошення автентифікуватись.
-  return corsResponse(JSON.stringify({
-    jsonrpc: '2.0', id: null, error: { code: -32001, message: reason }
-  }), 403);
+function unauthorized(env, url) {
+  if (!env.MCP_SHARED_SECRET) {
+    return corsResponse(JSON.stringify({
+      jsonrpc: '2.0', id: null,
+      error: { code: -32001, message: 'Server misconfigured: MCP_SHARED_SECRET is not set' }
+    }), 500);
+  }
+  // 401 + WWW-Authenticate — тепер це коректно: у нас Є OAuth, і саме цей
+  // заголовок каже клієнту, де шукати метадані, щоб пройти вхід самому.
+  return new Response(JSON.stringify({
+    jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Unauthorized' }
+  }), {
+    status: 401,
+    headers: {
+      'Content-Type': 'application/json',
+      'WWW-Authenticate': `Bearer resource_metadata="${url.origin}/.well-known/oauth-protected-resource"`
+    }
+  });
+}
+
+// ─── OAuth 2.1 (без стану, на HMAC) ───────────────────────────
+//
+// Навіщо: клієнт Claude вміє авторизуватись лише через OAuth. Без нього секрет
+// доводилось тримати у хвості URL конектора, звідки він світився в налаштуваннях
+// і писався в логи. Тут — мінімальний, але справжній OAuth 2.1 з PKCE.
+//
+// Сховища у воркера немає, тому стан НЕ зберігається ніде: client_id, код і
+// токен — це підписані HMAC-SHA256 блоби. Підпис на MCP_SHARED_SECRET, тож
+// підробити їх без секрету неможливо, а перевірити можна без бази.
+//
+// Роль MCP_SHARED_SECRET подвійна: ключ підпису + пароль на екрані входу.
+
+const TOKEN_TTL = 60 * 60 * 24 * 30;  // 30 днів
+const CODE_TTL  = 300;                // 5 хвилин
+
+function b64urlEncode(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64urlDecodeBytes(str) {
+  const pad = str.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(pad + '='.repeat((4 - pad.length % 4) % 4));
+  return Uint8Array.from(bin, c => c.charCodeAt(0));
+}
+
+async function hmacSign(secret, message) {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return b64urlEncode(new Uint8Array(sig));
+}
+
+// Підписаний блоб: <payload>.<signature>
+async function signBlob(payload, secret) {
+  const body = b64urlEncode(new TextEncoder().encode(JSON.stringify(payload)));
+  return `${body}.${await hmacSign(secret, body)}`;
+}
+
+async function verifyBlob(blob, secret, expectedType) {
+  if (typeof blob !== 'string' || !blob.includes('.')) return null;
+  const [body, sig] = blob.split('.', 2);
+  if (!body || !sig) return null;
+  if (!safeEqual(sig, await hmacSign(secret, body))) return null;
+  let payload;
+  try { payload = JSON.parse(new TextDecoder().decode(b64urlDecodeBytes(body))); }
+  catch { return null; }
+  if (expectedType && payload.typ !== expectedType) return null;
+  if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) return null;
+  return payload;
+}
+
+function jsonResponse(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+  });
+}
+
+// Метадані захищеного ресурсу — з них клієнт дізнається, де сервер авторизації.
+function oauthProtectedResource(url) {
+  return jsonResponse({
+    resource: `${url.origin}/mcp`,
+    authorization_servers: [url.origin]
+  });
+}
+
+function oauthServerMetadata(url) {
+  return jsonResponse({
+    issuer: url.origin,
+    authorization_endpoint: `${url.origin}/authorize`,
+    token_endpoint: `${url.origin}/token`,
+    registration_endpoint: `${url.origin}/register`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none'],
+    scopes_supported: ['mcp']
+  });
+}
+
+// Динамічна реєстрація. Нічого не зберігаємо: client_id — це підписаний список
+// дозволених redirect_uri. На /authorize ми його розпакуємо й звіримо.
+async function oauthRegister(request, url, env) {
+  if (!env.MCP_SHARED_SECRET) return jsonResponse({ error: 'server_error' }, 500);
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ error: 'invalid_request' }, 400); }
+
+  const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
+  if (!redirectUris.length) {
+    return jsonResponse({ error: 'invalid_redirect_uri', error_description: 'redirect_uris required' }, 400);
+  }
+  const clientId = await signBlob(
+    { typ: 'client', uris: redirectUris, iat: Math.floor(Date.now() / 1000) },
+    env.MCP_SHARED_SECRET
+  );
+  return jsonResponse({
+    client_id: clientId,
+    redirect_uris: redirectUris,
+    grant_types: ['authorization_code'],
+    response_types: ['code'],
+    token_endpoint_auth_method: 'none'
+  }, 201);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function loginPage(params, message) {
+  const hidden = ['client_id', 'redirect_uri', 'state', 'code_challenge', 'code_challenge_method', 'scope']
+    .map(k => params.get(k) ? `<input type="hidden" name="${k}" value="${escapeHtml(params.get(k))}">` : '')
+    .join('');
+  return new Response(`<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KeyCRM MCP</title>
+<style>
+ body{font:16px/1.5 system-ui,sans-serif;max-width:24rem;margin:15vh auto;padding:0 1rem;color:#111}
+ h1{font-size:1.15rem;margin:0 0 .25rem} p{color:#666;margin:0 0 1.5rem;font-size:.9rem}
+ input[type=password]{width:100%;padding:.6rem;font-size:1rem;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}
+ button{width:100%;margin-top:.75rem;padding:.6rem;font-size:1rem;border:0;border-radius:6px;background:#111;color:#fff;cursor:pointer}
+ .err{color:#b00;font-size:.875rem;margin-bottom:.75rem}
+ @media(prefers-color-scheme:dark){body{background:#111;color:#eee}p{color:#999}
+  input[type=password]{background:#1c1c1c;color:#eee;border-color:#444}button{background:#eee;color:#111}}
+</style>
+<h1>KeyCRM MCP</h1>
+<p>Підключення доступу до CRM. Введіть ключ доступу сервера.</p>
+${message ? `<div class="err">${escapeHtml(message)}</div>` : ''}
+<form method="POST">${hidden}
+ <input type="password" name="password" autofocus autocomplete="current-password" placeholder="Ключ доступу">
+ <button type="submit">Дозволити</button>
+</form>`, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+
+async function oauthAuthorize(request, url, env) {
+  if (!env.MCP_SHARED_SECRET) return new Response('Server misconfigured', { status: 500 });
+
+  const params = request.method === 'POST'
+    ? new URLSearchParams(await request.text())
+    : url.searchParams;
+
+  const clientId    = params.get('client_id') || '';
+  const redirectUri = params.get('redirect_uri') || '';
+  const challenge   = params.get('code_challenge') || '';
+  const state       = params.get('state') || '';
+
+  // Клієнт мусить бути нашим (підпис) і redirect_uri — із зареєстрованих.
+  const client = await verifyBlob(clientId, env.MCP_SHARED_SECRET, 'client');
+  if (!client) return new Response('invalid_client', { status: 400 });
+  if (!client.uris.includes(redirectUri)) return new Response('invalid_redirect_uri', { status: 400 });
+  if (params.get('code_challenge_method') !== 'S256' || !challenge) {
+    return new Response('PKCE S256 required', { status: 400 });
+  }
+
+  if (request.method === 'GET') return loginPage(params, null);
+
+  if (!safeEqual(params.get('password') || '', env.MCP_SHARED_SECRET)) {
+    return loginPage(params, 'Невірний ключ доступу.');
+  }
+
+  const code = await signBlob({
+    typ: 'code', cid: clientId, ruri: redirectUri, chal: challenge,
+    exp: Math.floor(Date.now() / 1000) + CODE_TTL
+  }, env.MCP_SHARED_SECRET);
+
+  const dest = new URL(redirectUri);
+  dest.searchParams.set('code', code);
+  if (state) dest.searchParams.set('state', state);
+  return Response.redirect(dest.toString(), 302);
+}
+
+async function oauthToken(request, url, env) {
+  if (!env.MCP_SHARED_SECRET) return jsonResponse({ error: 'server_error' }, 500);
+  const form = new URLSearchParams(await request.text());
+
+  if (form.get('grant_type') !== 'authorization_code') {
+    return jsonResponse({ error: 'unsupported_grant_type' }, 400);
+  }
+  const code = await verifyBlob(form.get('code') || '', env.MCP_SHARED_SECRET, 'code');
+  if (!code) return jsonResponse({ error: 'invalid_grant' }, 400);
+  if (code.ruri !== (form.get('redirect_uri') || '')) return jsonResponse({ error: 'invalid_grant' }, 400);
+  if (code.cid !== (form.get('client_id') || ''))     return jsonResponse({ error: 'invalid_client' }, 400);
+
+  // PKCE: SHA256(verifier) має збігтись із challenge, зафіксованим на /authorize.
+  const verifier = form.get('code_verifier') || '';
+  if (!verifier) return jsonResponse({ error: 'invalid_grant' }, 400);
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  if (!safeEqual(b64urlEncode(new Uint8Array(digest)), code.chal)) {
+    return jsonResponse({ error: 'invalid_grant', error_description: 'PKCE mismatch' }, 400);
+  }
+
+  const token = await signBlob({
+    typ: 'tok', exp: Math.floor(Date.now() / 1000) + TOKEN_TTL
+  }, env.MCP_SHARED_SECRET);
+
+  return jsonResponse({ access_token: token, token_type: 'Bearer', expires_in: TOKEN_TTL, scope: 'mcp' });
 }
 
 // ─── Статуси Malvia ──────────────────────────────────────────
@@ -128,9 +368,7 @@ const STATUS = {
   CONFIRMED_BY_OPERATOR: [26],
   PRODUCTION: [6],
   DELIVERY: [9, 20],
-  // 35 — «Відмова» на пошті. Немає у get_order_statuses, але в даних живе:
-  // 216 замовлень за лип–серп 2026, усі з трек-номером. Знайдено 24.08.2026.
-  RETURN: [28, 32, 35],
+  RETURN: [28, 32],
   COMPLETED: [12],
   CANCELLED: [13, 15, 16, 17, 18, 19, 21, 22, 24, 29, 31],
 };
@@ -142,7 +380,7 @@ const STATUS_GROUP = {
   26: 'Підтверджено',
   6:  'Виробництво',
   9:  'Доставка', 20: 'Доставка',
-  28: 'Повернення', 32: 'Повернення', 35: 'Повернення',
+  28: 'Повернення', 32: 'Повернення',
   12: 'Виконано',
   13: 'Відмінено', 15: 'Відмінено', 16: 'Відмінено', 17: 'Відмінено',
   18: 'Відмінено', 19: 'Відмінено', 21: 'Відмінено', 22: 'Відмінено',
@@ -186,7 +424,7 @@ async function handleMessage(message, env) {
         return { jsonrpc:'2.0', id, result:{
           protocolVersion:'2024-11-05',
           capabilities:{tools:{}},
-          serverInfo:{name:'keycrm-mcp',version:'8.4.1'}
+          serverInfo:{name:'keycrm-mcp',version:'8.4.0'}
         }};
       case 'notifications/initialized': return null;
       case 'ping': return { jsonrpc:'2.0', id, result:{} };

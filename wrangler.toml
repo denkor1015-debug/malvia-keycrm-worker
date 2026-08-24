@@ -1,0 +1,17 @@
+# Налаштування деплою KeyCRM MCP-воркера.
+# Заливкою керує .github/workflows/deploy-worker.yml — руками тут нічого запускати не треба.
+
+name = "keycrm-mcp"
+main = "src/keycrm-worker-v8.js"
+
+# ⚠️ ЗАПОВНИТИ перед першим деплоєм.
+# Взяти з дашборда: Workers & Pages → keycrm-mcp → Settings → Runtime → Compatibility date.
+# Це дата «правил гри» середовища Cloudflare. Якщо поставити іншу, ніж у живого
+# воркера, поведінка може непомітно змінитись — тому переписуємо один в один.
+compatibility_date = "ЗАПОВНИТИ-РРРР-ММ-ДД"
+
+# Воркер доступний за адресою *.workers.dev — лишаємо як є.
+workers_dev = true
+
+# Секрети (KEYCRM_API_KEY, NP_API_KEY, MCP_SHARED_SECRET) живуть у Cloudflare
+# і деплоєм коду не зачіпаються. Сюди їх не пишемо — тут вони були б відкритим текстом.

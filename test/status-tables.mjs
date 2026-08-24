@@ -77,8 +77,35 @@ if (!declared) {
   if (onlyTables.length) errors.push(`STATUS.RETURN має ${onlyTables.join(', ')}, а STATUS_REFUSED — ні (ці відмови випадуть з прогнозу викупу)`);
 }
 
+// 6. Довідник get_order_statuses — це те, що читає модель, коли вирішує,
+//    які статуси взяти у фільтр. Він живе окремо від таблиць розрахунку, і
+//    саме тому 35 місяцями рахувався правильно, але в довіднику його не було:
+//    ніщо не тримало ці два списки синхронними. Тепер тримає.
+const catStart = src.indexOf('function getOrderStatuses() {');
+const catEnd = catStart < 0 ? -1 : src.indexOf('\n}', catStart);
+if (catStart < 0 || catEnd < 0) {
+  errors.push('не знайдено getOrderStatuses — довідник статусів не перевірено');
+} else {
+  const getOrderStatuses =
+    new Function(src.slice(catStart, catEnd + 2) + '; return getOrderStatuses;')();
+  const catalogue = new Map(
+    Object.entries(getOrderStatuses().groups)
+      .flatMap(([group, items]) => items.map(s => [s.id, group]))
+  );
+  for (const id of inLists) {
+    if (!catalogue.has(id)) {
+      errors.push(`статус ${id} рахується (STATUS_GROUP: '${STATUS_GROUP[id]}'), але його немає в довіднику get_order_statuses — модель його не побачить і не вкаже у фільтрі`);
+    }
+  }
+  for (const [id, group] of catalogue) {
+    if (!inLists.has(id)) {
+      errors.push(`статус ${id} є в довіднику get_order_statuses (група '${group}'), але не входить у жоден список STATUS — classifyStatus поверне 'unknown'`);
+    }
+  }
+}
+
 if (errors.length) {
   console.error('✗ Таблиці статусів неповні:\n' + errors.map(e => '  • ' + e).join('\n'));
   process.exit(1);
 }
-console.log(`✓ Таблиці статусів цілі: ${Object.keys(PRODUCTION).length} прод-статусів класифікуються правильно, 'unknown' немає, STATUS_REFUSED збігається зі STATUS.RETURN.`);
+console.log(`✓ Таблиці статусів цілі: ${Object.keys(PRODUCTION).length} прод-статусів класифікуються правильно, 'unknown' немає, STATUS_REFUSED збігається зі STATUS.RETURN, довідник get_order_statuses збігається з таблицями.`);

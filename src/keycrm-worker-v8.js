@@ -56,7 +56,7 @@ export default {
     if (request.method === 'OPTIONS') return corsResponse(null, 204);
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/') {
-      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.3 running ✓' }), 200);
+      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.4 running ✓' }), 200);
     }
     // /mcp або /mcp/<секрет> — друге для клієнтів, де можна задати лише URL.
     if (request.method === 'POST' && (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/'))) {
@@ -128,8 +128,9 @@ const STATUS = {
   CONFIRMED_BY_OPERATOR: [26],
   PRODUCTION: [6],
   DELIVERY: [9, 20],
-  // 35 — «Відмова» на пошті. Немає у get_order_statuses, але в даних живе:
-  // 216 замовлень за лип–серп 2026, усі з трек-номером. Знайдено 24.08.2026.
+  // 35 — «Відмова» на пошті: 216 замовлень за лип–серп 2026, усі з трек-номером.
+  // Знайдено 24.08.2026 — у довіднику CRM його не було взагалі. Довідник
+  // get_order_statuses тепер його містить, і тест стежить, щоб не розійшлись.
   RETURN: [28, 32, 35],
   COMPLETED: [12],
   CANCELLED: [13, 15, 16, 17, 18, 19, 21, 22, 24, 29, 31],
@@ -186,7 +187,7 @@ async function handleMessage(message, env) {
         return { jsonrpc:'2.0', id, result:{
           protocolVersion:'2024-11-05',
           capabilities:{tools:{}},
-          serverInfo:{name:'keycrm-mcp',version:'8.4.3'}
+          serverInfo:{name:'keycrm-mcp',version:'8.4.4'}
         }};
       case 'notifications/initialized': return null;
       case 'ping': return { jsonrpc:'2.0', id, result:{} };

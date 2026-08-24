@@ -1,0 +1,85 @@
+# Деплой KeyCRM MCP-воркера у Cloudflare.
+#
+# Запускається сам, коли в гілку main потрапляє зміна коду воркера або
+# wrangler.toml. Перед заливкою проганяє перевірки; після заливки сам
+# переконується, що жива версія справді змінилась.
+#
+# Секрети (Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN   — токен із правом «Workers Scripts: Edit», з терміном дії
+#   CLOUDFLARE_ACCOUNT_ID  — ID акаунта, видно в URL дашборда
+# Обидва лежать поза репозиторієм і видаляються кнопкою.
+
+name: Деплой KeyCRM-воркера
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/keycrm-worker-v8.js'
+      - 'test/status-tables.mjs'
+      - 'wrangler.toml'
+      - '.github/workflows/deploy-worker.yml'
+  workflow_dispatch:
+
+# Два деплої одночасно = гонка за те, чия версія лишиться живою.
+concurrency:
+  group: deploy-keycrm-worker
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Якщо в налаштуваннях цього environment увімкнути Required reviewers,
+    # кожен деплой чекатиме на твоє підтвердження в GitHub.
+    environment: production
+
+    steps:
+      # Сторонні дії прив'язані до конкретного коміту, а не до рухомого тега —
+      # інакше зламаний реліз чужої дії автоматично потрапляє в наш деплой.
+      - name: Забрати код
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+
+      - name: Синтаксис воркера
+        run: node --check src/keycrm-worker-v8.js
+
+      - name: Таблиці статусів цілі
+        run: node test/status-tables.mjs
+
+      - name: Яку версію очікуємо після деплою
+        id: version
+        run: |
+          v=$(grep -o 'KeyCRM MCP Server v[0-9.]*' src/keycrm-worker-v8.js | head -1 | sed 's/.*v//')
+          if [ -z "$v" ]; then echo "Не знайшов номер версії у файлі воркера"; exit 1; fi
+          echo "expected=$v" >> "$GITHUB_OUTPUT"
+          echo "Очікувана версія: $v"
+
+      - name: Деплой у Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4.125.0 deploy
+
+      - name: Перевірити, що жива версія змінилась
+        run: |
+          expected="${{ steps.version.outputs.expected }}"
+          for i in $(seq 1 10); do
+            got=$(curl -sS --max-time 15 https://keycrm-mcp.malviainua.workers.dev/ || true)
+            echo "спроба $i: $got"
+            case "$got" in
+              *"v$expected running"*)
+                echo "✓ У проді версія $expected"
+                exit 0 ;;
+            esac
+            sleep 6
+          done
+          echo "✗ Через хвилину після деплою прод усе ще не віддає версію $expected."
+          echo "  Перевір воркер у дашборді Cloudflare; відкат — вкладка Deployments → Rollback."
+          exit 1

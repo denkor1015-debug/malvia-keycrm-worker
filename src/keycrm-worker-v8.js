@@ -56,7 +56,7 @@ export default {
     if (request.method === 'OPTIONS') return corsResponse(null, 204);
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/') {
-      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.2 running ✓' }), 200);
+      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.3 running ✓' }), 200);
     }
     // /mcp або /mcp/<секрет> — друге для клієнтів, де можна задати лише URL.
     if (request.method === 'POST' && (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/'))) {
@@ -186,7 +186,7 @@ async function handleMessage(message, env) {
         return { jsonrpc:'2.0', id, result:{
           protocolVersion:'2024-11-05',
           capabilities:{tools:{}},
-          serverInfo:{name:'keycrm-mcp',version:'8.4.2'}
+          serverInfo:{name:'keycrm-mcp',version:'8.4.3'}
         }};
       case 'notifications/initialized': return null;
       case 'ping': return { jsonrpc:'2.0', id, result:{} };
@@ -614,7 +614,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         pending_status_id: { description: 'ID статусу(ів), які треба закрити. Число або масив. За замовчуванням 26 ("Прийнято"). Часті: 2 = Уточнення, 6 = Виготовляється, 26 = Прийнято. Напр. [2,6] — взяти обидва разом.' },
-        return_status_id:  { description: 'ID статусу(ів) повернень. Число або масив. За замовчуванням 28 ("Повернення назад"). Ще релевантні: 32 = Відмова на пошті, 29 = Не підійшов/немає розміру.' },
+        return_status_id:  { description: 'ID статусу(ів) повернень. Число або масив. За замовчуванням 28 ("Повернення назад"). ВАЖЛИВО: відмова на пошті писалась трьома статусами за літо 2026 — 32 (черв–лип), 35 (лип–серп), 28 (серп→). Щоб побачити всі повернення за період, передавай [28, 32, 35], інакше частина не потрапить у вибірку. Ще релевантний: 29 = Не підійшов/немає розміру.' },
         date_from: { type: 'string', description: 'Дата початку YYYY-MM-DD (опціонально)' },
         date_to:   { type: 'string', description: 'Дата кінця YYYY-MM-DD (опціонально)' }
       }
@@ -1245,8 +1245,11 @@ function getOrderStatuses() {
       'Доставка':     [
         { id:9,  name:'Доставляється' },
         { id:20, name:'Прибув у відділення' },
-        { id:28, name:'Повернення назад' },
-        { id:32, name:'Відмова на пошті' },
+        // Відмова на пошті писалась трьома статусами за літо 2026 —
+        // це один і той самий результат, рахувати треба всі три.
+        { id:28, name:'Повернення назад (відмова на пошті, серп→)' },
+        { id:32, name:'Відмова на пошті (черв–лип)' },
+        { id:35, name:'Відмова (лип–серп)' },
       ],
       'Виконано':     [{ id:12, name:'Виконано 💰 (викуплено)' }],
       'Відмінено':    [
@@ -1360,7 +1363,7 @@ async function getFunnelByCampaign(apiKey, args) {
       production:  'Виготовляється (ID 6)',
       delivery:    'Доставляється / Прибув (ID 9, 20)',
       completed:   'Виконано — гроші на рахунку (ID 12)',
-      returned:    'Повернення / Відмова на пошті (ID 28, 32)',
+      returned:    'Повернення / Відмова на пошті (ID 28, 32, 35 — три статуси за різні місяці)',
       cancelled:   'Відмінено (ID 13,15,16,17,18,19,21,22,24,29,31)',
       in_progress: 'Ще в обробці КЦ (ID 2,3,4,23,25,33,34)',
     },

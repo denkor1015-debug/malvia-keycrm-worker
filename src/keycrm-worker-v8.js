@@ -56,7 +56,7 @@ export default {
     if (request.method === 'OPTIONS') return corsResponse(null, 204);
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/') {
-      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.1 running ✓' }), 200);
+      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.2 running ✓' }), 200);
     }
     // /mcp або /mcp/<секрет> — друге для клієнтів, де можна задати лише URL.
     if (request.method === 'POST' && (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/'))) {
@@ -186,7 +186,7 @@ async function handleMessage(message, env) {
         return { jsonrpc:'2.0', id, result:{
           protocolVersion:'2024-11-05',
           capabilities:{tools:{}},
-          serverInfo:{name:'keycrm-mcp',version:'8.4.1'}
+          serverInfo:{name:'keycrm-mcp',version:'8.4.2'}
         }};
       case 'notifications/initialized': return null;
       case 'ping': return { jsonrpc:'2.0', id, result:{} };
@@ -1702,7 +1702,13 @@ async function getManagerStats(apiKey, args) {
 // будь-яка оцінка по ній систематично завищена. Бери вікно, де все відпрацьовано.
 
 const STATUS_BOUGHT   = 12;   // Виконано (викуплено)
-const STATUS_REFUSED  = 32;   // Відмова на пошті
+
+// Відмова на пошті писалась трьома різними статусами за літо 2026:
+// 32 «Відмова на пошті» (черв–лип) → 35 «Відмова» (лип–серп) → 28 «Повернення
+// назад» (серп). Рахувати тільки 32 означає не бачити частину відмов: за липень
+// 201 з 356, за серпень — жодної з 180, тобто викуп читався б як 100%.
+// Тримати цей список синхронним зі STATUS.RETURN — test/status-tables.mjs перевіряє.
+const STATUS_REFUSED  = [32, 35, 28];
 const STATUS_NODIAL   = [25, 23];  // Недозвон, Передзвонити
 const STATUS_APPROVED = [26, 6];   // Прийнято ✓, Виготовляється
 
@@ -1728,13 +1734,26 @@ function orderArticle(order) {
   return '(без артикула)';
 }
 
+// filter[status_id] в KeyCRM приймає рівно один статус, тому по кожному статусу
+// відмови йде свій запит, а результати склеюються. Послідовно, а не Promise.all:
+// три паралельні пагінації разом із вибіркою викуплених швидше впираються
+// в ліміт підзапитів Cloudflare.
+async function getOrdersForStatuses(apiKey, params, statuses, withProducts) {
+  const fetchOne = withProducts ? getAllOrdersWithProducts : getAllOrders;
+  const out = [];
+  for (const id of statuses) {
+    out.push(...await fetchOne(apiKey, { ...params, 'filter[status_id]': id }));
+  }
+  return out;
+}
+
 async function getBuyoutByUpsell(apiKey, args) {
   const { date_from, date_to, min_orders = 20 } = args;
   const base = { 'filter[created_between]': `${date_from} 00:00:00, ${date_to} 23:59:59` };
 
   const [bought, refused] = await Promise.all([
     getAllOrdersWithProducts(apiKey, { ...base, 'filter[status_id]': STATUS_BOUGHT }),
-    getAllOrdersWithProducts(apiKey, { ...base, 'filter[status_id]': STATUS_REFUSED }),
+    getOrdersForStatuses(apiKey, base, STATUS_REFUSED, true),
   ]);
 
   const GROUPS = ['без апсейлу', 'тільки пакування', 'преміум'];
@@ -1861,7 +1880,7 @@ async function getBuyoutByCalls(apiKey, args) {
 
   const [bought, refused] = await Promise.all([
     getAllOrders(apiKey, { ...base, 'filter[status_id]': STATUS_BOUGHT, include: 'status' }),
-    getAllOrders(apiKey, { ...base, 'filter[status_id]': STATUS_REFUSED, include: 'status' }),
+    getOrdersForStatuses(apiKey, { ...base, include: 'status' }, STATUS_REFUSED, false),
   ]);
 
   // Детермінована псевдовипадкова вибірка: та сама когорта дає той самий результат,

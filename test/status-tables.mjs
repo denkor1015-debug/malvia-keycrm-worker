@@ -61,8 +61,24 @@ for (const id of [28, 32, 35]) {
   if (classifyStatus(id) !== 'return') errors.push(`статус ${id} — це відмова на пошті, має бути 'return'`);
 }
 
+// 5. Інструменти прогнозу викупу фільтрують замовлення по власному списку
+//    STATUS_REFUSED (бо filter[status_id] приймає один статус за раз, а не
+//    класифікацію). Цей список має збігатися зі STATUS.RETURN — інакше воронка
+//    й прогноз викупу почнуть рахувати відмови по-різному, і ніхто не помітить.
+const declared = src.match(/const STATUS_REFUSED\s*=\s*\[([0-9,\s]+)\]/);
+if (!declared) {
+  errors.push('не знайдено STATUS_REFUSED — інструменти прогнозу викупу могли змінити спосіб фільтрації');
+} else {
+  const refusedInTools = new Set(declared[1].split(',').map(x => Number(x.trim())).filter(Number.isFinite));
+  const refusedInTables = new Set(STATUS.RETURN);
+  const onlyTools = [...refusedInTools].filter(x => !refusedInTables.has(x));
+  const onlyTables = [...refusedInTables].filter(x => !refusedInTools.has(x));
+  if (onlyTools.length)  errors.push(`STATUS_REFUSED має ${onlyTools.join(', ')}, а STATUS.RETURN — ні`);
+  if (onlyTables.length) errors.push(`STATUS.RETURN має ${onlyTables.join(', ')}, а STATUS_REFUSED — ні (ці відмови випадуть з прогнозу викупу)`);
+}
+
 if (errors.length) {
   console.error('✗ Таблиці статусів неповні:\n' + errors.map(e => '  • ' + e).join('\n'));
   process.exit(1);
 }
-console.log(`✓ Таблиці статусів цілі: ${Object.keys(PRODUCTION).length} прод-статусів класифікуються правильно, 'unknown' немає.`);
+console.log(`✓ Таблиці статусів цілі: ${Object.keys(PRODUCTION).length} прод-статусів класифікуються правильно, 'unknown' немає, STATUS_REFUSED збігається зі STATUS.RETURN.`);

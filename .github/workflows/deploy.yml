@@ -18,7 +18,7 @@ on:
       - 'src/keycrm-worker-v8.js'
       - 'test/status-tables.mjs'
       - 'wrangler.toml'
-      - '.github/workflows/deploy-worker.yml'
+      - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
 # Два деплої одночасно = гонка за те, чия версія лишиться живою.

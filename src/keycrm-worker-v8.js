@@ -2,6 +2,12 @@
 // KeyCRM MCP Server для Cloudflare Workers
 // Версія 8.4 — закрито відкритий ендпоінт.
 //
+// v8.4.5 (тільки додано):
+//   [НОВЕ] get_offer_stocks: залишок і резерв по списку SKU (GET /offers/stocks,
+//          пачками по 50). Потрібен вечірній перевірці складу в бізнес-репо:
+//          щоб помітити, коли залишок складського товару росте без заливки
+//          (масове закриття повернень → фантомні штуки на сайтах).
+//
 // ЗМІНИ ПРОТИ v8.3 (безпека; логіка тулів не чіпалась):
 //   [ФІКС] /mcp більше не відкритий. Був доступний будь-кому, хто знає URL,
 //          разом із правом ЗАПИСУ: create_order, update_order, update_product,
@@ -56,7 +62,7 @@ export default {
     if (request.method === 'OPTIONS') return corsResponse(null, 204);
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/') {
-      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.4 running ✓' }), 200);
+      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.5 running ✓' }), 200);
     }
     // /mcp або /mcp/<секрет> — друге для клієнтів, де можна задати лише URL.
     if (request.method === 'POST' && (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/'))) {
@@ -187,7 +193,7 @@ async function handleMessage(message, env) {
         return { jsonrpc:'2.0', id, result:{
           protocolVersion:'2024-11-05',
           capabilities:{tools:{}},
-          serverInfo:{name:'keycrm-mcp',version:'8.4.4'}
+          serverInfo:{name:'keycrm-mcp',version:'8.4.5'}
         }};
       case 'notifications/initialized': return null;
       case 'ping': return { jsonrpc:'2.0', id, result:{} };
@@ -370,6 +376,17 @@ const TOOLS = [
         query: { type: 'string', description: 'Артикул або назва товару. Приклад: "21-154" або "сукня"' }
       },
       required: ['query']
+    }
+  },
+  {
+    name: 'get_offer_stocks',
+    description: 'Залишок і резерв на складі по списку SKU варіантів (офферів). Повертає {sku: {quantity, reserve, free}}, де free = quantity − reserve. Пачками по 50 SKU на запит, до 1500 SKU за виклик. SKU, яких немає в CRM, — у полі missing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        skus: { type: 'array', items: { type: 'string' }, description: 'SKU офферів. Приклад: ["1144","1145"]' }
+      },
+      required: ['skus']
     }
   },
   {
@@ -698,6 +715,7 @@ async function callTool(name, args, apiKey, npKey = '') {
     case 'create_keycrm_product':  return createKeyCrmProduct(apiKey, args);
     case 'create_keycrm_offers':   return createKeyCrmOffers(apiKey, args);
     case 'get_product_offers':     return getProductOffers(apiKey, args);
+    case 'get_offer_stocks':       return getOfferStocks(apiKey, args);
     case 'create_order':           return createOrder(apiKey, args, npKey);
     case 'get_keycrm_users':       return getKeyCrmUsers(apiKey);
     case 'get_all_products':       return getAllProducts(apiKey, args);
@@ -2178,6 +2196,28 @@ async function createKeyCrmOffers(apiKey, args) {
   const { productId, offers } = args;
   const data = await keycrmPost(apiKey, `/products/${productId}/offers`, { offers });
   return data;
+}
+
+async function getOfferStocks(apiKey, args) {
+  const skus = [...new Set((args.skus || []).map(s => String(s).trim()).filter(Boolean))];
+  if (!skus.length) throw new Error('Передай skus — непорожній список SKU');
+  // 30 пачок = 30 підзапитів; безкоштовний Cloudflare дає 50 на виклик
+  if (skus.length > 1500) throw new Error(`Забагато SKU (${skus.length}), максимум 1500 за виклик`);
+
+  const stocks = {};
+  for (let i = 0; i < skus.length; i += 50) {
+    const chunk = skus.slice(i, i + 50);
+    const data = await keycrmGet(apiKey, '/offers/stocks', {
+      limit: 50, 'filter[offers_sku]': chunk.join(',')
+    });
+    for (const r of (data.data || [])) {
+      const quantity = Number(r.quantity) || 0;
+      const reserve  = Number(r.reserve)  || 0;
+      stocks[String(r.sku)] = { quantity, reserve, free: quantity - reserve };
+    }
+  }
+  return { count: Object.keys(stocks).length, stocks,
+           missing: skus.filter(s => !(s in stocks)) };
 }
 
 async function getProductOffers(apiKey, args) {

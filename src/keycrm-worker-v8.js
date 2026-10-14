@@ -2,6 +2,11 @@
 // KeyCRM MCP Server для Cloudflare Workers
 // Версія 8.4 — закрито відкритий ендпоінт.
 //
+// v8.4.8 (тільки додано):
+//   [НОВЕ] get_offer_reserve_holders: які замовлення тримають резерв на SKU.
+//          Вечірній прогін показує SKU «у мінусі», але не каже, чиї це замовлення —
+//          раніше лишалось смикати get_order на кожне (146 лише у «Виготовляється»).
+//
 // v8.4.7 (тільки додано):
 //   [НОВЕ] виробник Люда-Лёня (з 14.10.2026; категорія KeyCRM 8, тег Люда-Лёня):
 //          у MANUFACTURER_TAGS (get_period_summary) і CATEGORY_TAG (create_order),
@@ -73,7 +78,7 @@ export default {
     if (request.method === 'OPTIONS') return corsResponse(null, 204);
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/') {
-      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.7 running ✓' }), 200);
+      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.8 running ✓' }), 200);
     }
     // /mcp або /mcp/<секрет> — друге для клієнтів, де можна задати лише URL.
     if (request.method === 'POST' && (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/'))) {
@@ -204,7 +209,7 @@ async function handleMessage(message, env) {
         return { jsonrpc:'2.0', id, result:{
           protocolVersion:'2024-11-05',
           capabilities:{tools:{}},
-          serverInfo:{name:'keycrm-mcp',version:'8.4.7'}
+          serverInfo:{name:'keycrm-mcp',version:'8.4.8'}
         }};
       case 'notifications/initialized': return null;
       case 'ping': return { jsonrpc:'2.0', id, result:{} };
@@ -396,6 +401,18 @@ const TOOLS = [
       type: 'object',
       properties: {
         skus: { type: 'array', items: { type: 'string' }, description: 'SKU офферів. Приклад: ["1144","1145"]' }
+      },
+      required: ['skus']
+    }
+  },
+  {
+    name: 'get_offer_reserve_holders',
+    description: 'Які замовлення тримають резерв на SKU варіантів (офферів) — для SKU «у мінусі» з вечірнього прогону. По кожному SKU: залишок/резерв і список замовлень (статус, дата зміни статусу, кількість, stock_status рядка, ТТН, служба доставки), найраніше підтверджені першими. over_stock: true — рядок, на який штуки не вистачає (виліт найпізніше підтверджених). Рядки зі stock_status fulfilled (уже списані при відправці) не показуються. Сканує статуси до відправки; рахує на сервері, повних карток не віддає.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        skus: { type: 'array', items: { type: 'string' }, description: 'SKU офферів (до 200). Приклад: ["1983","887"]' },
+        status_ids: { type: 'array', items: { type: 'number' }, description: 'Статуси, які сканувати (опціонально). За замовчуванням усі до відправки: [1,2,3,4,23,25,26,33,34,6]' }
       },
       required: ['skus']
     }
@@ -727,6 +744,7 @@ async function callTool(name, args, apiKey, npKey = '') {
     case 'create_keycrm_offers':   return createKeyCrmOffers(apiKey, args);
     case 'get_product_offers':     return getProductOffers(apiKey, args);
     case 'get_offer_stocks':       return getOfferStocks(apiKey, args);
+    case 'get_offer_reserve_holders': return getOfferReserveHolders(apiKey, args);
     case 'create_order':           return createOrder(apiKey, args, npKey);
     case 'get_keycrm_users':       return getKeyCrmUsers(apiKey);
     case 'get_all_products':       return getAllProducts(apiKey, args);
@@ -2229,6 +2247,126 @@ async function getOfferStocks(apiKey, args) {
   }
   return { count: Object.keys(stocks).length, stocks,
            missing: skus.filter(s => !(s in stocks)) };
+}
+
+// ─── [НОВЕ v8.4.8] Хто тримає резерв на SKU ───
+//
+// НАВІЩО: вечірній прогін (stock_check.py у бізнес-репо) показує SKU, де резерв
+// більший за залишок, але не каже, ЯКІ замовлення його тримають. Список замовлень
+// KeyCRM віддає товар назвою, без SKU варіанта, тож лишалось смикати get_order на
+// кожне — ~2 700 токенів за картку. Тут зіставлення робиться всередині воркера.
+//
+// ЩО ПЕРЕВІРЕНО (14.10.2026, замовлення 15306): при переході в «Доставляється» (9)
+// рядки стають stock_status 'fulfilled' — штуку списано, резерву вже немає. Тому
+// за замовчуванням скануються лише статуси ДО відправки, а 'fulfilled' пропускається.
+// SKU з від'ємним залишком і нульовим резервом (459, 1405 того вечора) — це вже
+// списані штуки: тримачів резерву в нього не буде, і це правильна відповідь.
+
+const RESERVE_SCAN_STATUSES = [1, 2, 3, 4, 23, 25, 26, 33, 34, 6];
+// Безкоштовний Cloudflare дає 50 підзапитів на виклик — лишаємо запас.
+const RESERVE_SCAN_BUDGET = 45;
+
+// ⟪reserve-holders⟫ чиста функція без запитів — test/reserve-holders.mjs вирізає її за цією міткою
+function findReserveHolders(orders, skus, stocks, statusNames = {}) {
+  const prop = (p, re) => {
+    const list = (p.properties && p.properties.length) ? p.properties : (p.offer?.properties || []);
+    const hit = list.find(pr => re.test(pr.name || ''));
+    return hit ? hit.value : '';
+  };
+  const bySku = {};
+  for (const sku of skus) bySku[sku] = [];
+
+  for (const o of orders) {
+    for (const p of (o.products || [])) {
+      const sku = String(p.offer?.sku || p.sku || '');
+      if (!(sku in bySku) || p.stock_status === 'fulfilled') continue;
+      bySku[sku].push({
+        order_id: o.id,
+        status_id: o.status_id,
+        status_name: statusNames[o.status_id] || String(o.status_id),
+        created_at: o.created_at,
+        status_changed_at: o.status_changed_at || null,
+        qty: Number(p.quantity) || 1,
+        stock_status: p.stock_status || null,
+        name: p.name,
+        color: prop(p, /колір|цвет|color/i),
+        size: prop(p, /розмір|размер|size/i),
+        ttn: o.shipping?.tracking_code || null,
+        delivery_service_id: o.shipping?.delivery_service_id ?? null,
+      });
+    }
+  }
+
+  const out = {};
+  for (const sku of skus) {
+    const st = stocks[sku] || { quantity: 0, reserve: 0, free: 0 };
+    // Штука дістається тому, хто раніше підтверджений — те саме правило, що в stock_check.py.
+    const holders = bySku[sku].sort((a, b) =>
+      String(a.status_changed_at || '').localeCompare(String(b.status_changed_at || '')));
+    let left = Math.max(st.quantity, 0);
+    for (const h of holders) {
+      h.over_stock = left < h.qty;
+      left = Math.max(left - h.qty, 0);
+    }
+    const reservedFound = holders.filter(h => h.stock_status === 'reserved')
+                                 .reduce((s, h) => s + h.qty, 0);
+    out[sku] = {
+      ...st,
+      reserved_found: reservedFound,
+      ...(reservedFound !== st.reserve
+          ? { reserve_mismatch: `у CRM резерв ${st.reserve}, у просканованих статусах знайдено ${reservedFound}` }
+          : {}),
+      over_stock_order_ids: holders.filter(h => h.over_stock).map(h => h.order_id),
+      holders,
+    };
+  }
+  return out;
+}
+// ⟪/reserve-holders⟫
+
+async function getOfferReserveHolders(apiKey, args = {}) {
+  const skus = [...new Set((args.skus || []).map(s => String(s).trim()).filter(Boolean))];
+  if (!skus.length) throw new Error('Передай skus — непорожній список SKU');
+  if (skus.length > 200) throw new Error(`Забагато SKU (${skus.length}), максимум 200 за виклик`);
+  const statusIds = (Array.isArray(args.status_ids) && args.status_ids.length
+    ? args.status_ids : RESERVE_SCAN_STATUSES).map(Number);
+
+  const { stocks, missing } = await getOfferStocks(apiKey, { skus });
+  let used = Math.ceil(skus.length / 50);
+
+  // Послідовно, не Promise.all: ліміт KeyCRM спільний із лендінгами.
+  const orders = [];
+  const scanned = {};
+  const incomplete = [];
+  for (const id of statusIds) {
+    scanned[id] = 0;
+    for (let page = 1; ; page++) {
+      if (used >= RESERVE_SCAN_BUDGET) { incomplete.push(id); break; }
+      const data = await keycrmGet(apiKey, '/order', {
+        'filter[status_id]': id, include: 'products.offer,shipping', limit: 50, page
+      });
+      used++;
+      const batch = data.data || [];
+      orders.push(...batch);
+      scanned[id] += batch.length;
+      if (batch.length < 50 || page >= (data.last_page || 1)) break;
+    }
+  }
+
+  const statusNames = {};
+  for (const list of Object.values(getOrderStatuses().groups)) {
+    for (const s of list) statusNames[s.id] = s.name;
+  }
+
+  return {
+    statuses_scanned: scanned,
+    orders_scanned: orders.length,
+    ...(incomplete.length ? { incomplete_statuses: incomplete,
+        warning: 'Вичерпано ліміт підзапитів Cloudflare — ці статуси проскановано не повністю. Передай менше status_ids.' } : {}),
+    ...(missing.length ? { missing_skus: missing } : {}),
+    skus: findReserveHolders(orders, skus, stocks, statusNames),
+    note: 'holders — замовлення з рядком на цей SKU, найраніше підтверджені першими. over_stock: true — на цей рядок штуки не вистачає (залишок уже покрив раніших). Рядки fulfilled (списані при відправці) не показуються. reserve_mismatch — частину резерву тримають замовлення в статусах, яких не скановано.'
+  };
 }
 
 async function getProductOffers(apiKey, args) {

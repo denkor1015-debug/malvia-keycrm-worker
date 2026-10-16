@@ -22,6 +22,34 @@ It runs in production at `https://keycrm-mcp.malviainua.workers.dev` and is prot
 shared secret — the server **refuses every request** if that secret isn't configured
 (fail-closed).
 
+## Buyout by variant: `get_funnel_by_variant`
+
+Answers *"which colors and sizes get ordered, and, more importantly, which ones customers
+actually pick up at the post office"*. It counts **units** (order line × quantity) of one
+product; other products in the same order and upsells are left out, and each unit takes
+its order's status.
+
+- `buyout_rate` = completed (12) ÷ (completed + refused at the post office: 28 + 32 + 35).
+  Units still in transit (9, 20) are not counted yet.
+- For the total and for every color, size and color × size: ordered, cancelled (with
+  `no_size_29`, "doesn't fit / size not available"), pending, in transit, completed,
+  refused, a 95% Wilson interval, and `low_n` when fewer than 20 units were sent.
+- Fields for cross-checking: `orders_total` and `orders_by_class` use the same keys as
+  `get_funnel_by_product`; `multi_variant_orders` counts orders with 2+ colors, where the
+  CRM can't see a partial pickup; `unknown_statuses` lists status ids missing from the tables.
+
+**Long periods.** KeyCRM's `GET /order` cannot filter by product (checked against the API
+spec on 2026-10-16), so the worker pages through every order in the window, 50 per page.
+The free Cloudflare plan allows 50 subrequests per call, so one call reads at most 45 pages.
+If the window needs more, the answer says `complete: false` and carries `next.cursor`, a
+short string with the running counts and a checksum. Call again with the same arguments
+plus that cursor; the full breakdown arrives with the last call. If KeyCRM answers 429
+mid-call, the tool returns the partial result and a cursor instead of an error.
+
+```
+get_funnel_by_variant { sku: "21-225", date_from: "2025-11-01", date_to: "2025-11-20" }
+```
+
 ## ⚠️ This is the single source of truth for the worker code
 
 Old copies of this file live in the business repo (`Malvia Business/tools/`). **They are
@@ -93,6 +121,33 @@ One hole stays open on purpose (documented, not yet closed): `STATUS_REFUSED = 3
 Cloudflare-воркер, через який Claude ходить у KeyCRM: воронки, P&L по товарах,
 підсумки періоду, статистика КЦ. Живе за адресою
 `https://keycrm-mcp.malviainua.workers.dev`.
+
+## Викуп по варіантах: `get_funnel_by_variant`
+
+Відповідає на питання *«які кольори й розміри замовляють і, головне, які краще
+забирають на пошті»*. Рахує **штуки** (позиція × кількість) одного товару: інші
+товари в замовленні й апсейли не рахуються, статус штуки = статус її замовлення.
+
+- `buyout_rate` = виконано (12) ÷ (виконано + відмови на пошті 28 + 32 + 35).
+  Те, що ще в дорозі (9, 20), у викуп не входить.
+- Для підсумку і кожного кольору, розміру й колір × розмір: замовлено, скасовано
+  (окремо `no_size_29` — «Не підійшов / Немає розміру»), чекає відправки, у дорозі,
+  виконано, відмова, 95% інтервал Вілсона і `low_n`, якщо відправлено менше 20 штук.
+- Для звірки: `orders_total` і `orders_by_class` — у тих самих ключах, що
+  `get_funnel_by_product`; `multi_variant_orders` — замовлення з 2+ кольорами
+  (частковий викуп CRM не бачить); `unknown_statuses` — статуси поза таблицями.
+
+**Довгий період.** Фільтра за товаром у `GET /order` KeyCRM немає (звірено зі
+специфікацією API 16.10.2026), тож воркер гортає всі замовлення вікна по 50. Безкоштовний
+Cloudflare дає 50 підзапитів на виклик, тому один виклик читає не більше 45 сторінок.
+Якщо треба більше, відповідь каже `complete: false` і несе `next.cursor` — короткий
+рядок із проміжними лічильниками й контрольною сумою. Виклич ще раз з тими самими
+аргументами і цим cursor; повний розріз прийде в останньому виклику. Якщо KeyCRM
+посеред виклику відповість 429, інструмент віддасть частковий результат і cursor, а не помилку.
+
+```
+get_funnel_by_variant { sku: "21-225", date_from: "2025-11-01", date_to: "2025-11-20" }
+```
 
 ## ⚠️ Це єдине джерело правди для коду воркера
 

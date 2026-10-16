@@ -2,6 +2,12 @@
 // KeyCRM MCP Server для Cloudflare Workers
 // Версія 8.4 — закрито відкритий ендпоінт.
 //
+// v8.4.9 (тільки додано):
+//   [НОВЕ] get_funnel_by_variant: воронка і викуп по кольорах, розмірах і колір×розмір
+//          у штуках, з інтервалом Вілсона. Довгий період — кількома викликами через
+//          cursor: фільтра за товаром у GET /order немає, а 50 підзапитів на виклик
+//          вистачає лише на ~45 сторінок замовлень.
+//
 // v8.4.8 (тільки додано):
 //   [НОВЕ] get_offer_reserve_holders: які замовлення тримають резерв на SKU.
 //          Вечірній прогін показує SKU «у мінусі», але не каже, чиї це замовлення —
@@ -78,7 +84,7 @@ export default {
     if (request.method === 'OPTIONS') return corsResponse(null, 204);
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/') {
-      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.8 running ✓' }), 200);
+      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.9 running ✓' }), 200);
     }
     // /mcp або /mcp/<секрет> — друге для клієнтів, де можна задати лише URL.
     if (request.method === 'POST' && (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/'))) {
@@ -209,7 +215,7 @@ async function handleMessage(message, env) {
         return { jsonrpc:'2.0', id, result:{
           protocolVersion:'2024-11-05',
           capabilities:{tools:{}},
-          serverInfo:{name:'keycrm-mcp',version:'8.4.8'}
+          serverInfo:{name:'keycrm-mcp',version:'8.4.9'}
         }};
       case 'notifications/initialized': return null;
       case 'ping': return { jsonrpc:'2.0', id, result:{} };
@@ -270,6 +276,21 @@ const TOOLS = [
         sku:      { type:'string', description:'Артикул товару. Приклад: "21-05"' },
         date_from:{ type:'string', description:'Дата початку YYYY-MM-DD' },
         date_to:  { type:'string', description:'Дата кінця YYYY-MM-DD' }
+      },
+      required:['sku','date_from','date_to']
+    }
+  },
+  {
+    name: 'get_funnel_by_variant',
+    description: 'Воронка і ВИКУП по варіантах товару: колір, розмір, колір×розмір — за період (дата створення замовлення). Рахує ШТУКИ (позиція × кількість), лише позиції цього товару: інші товари в замовленні й апсейли (Преміум, пакування) не рахуються; статус штуки = статус її замовлення. Викуп (забір на пошті) = виконано (12) ÷ (виконано + відмови на пошті 28+32+35); у дорозі (9, 20) у викуп не входять. Для підсумку і кожної групи: ordered, cancelled, no_size_29 (скасовано «Не підійшов / Немає розміру» — варіанта не було), pending (ще до відправки), in_transit, completed, refused, sent, buyout_rate, ci95 (95% інтервал Вілсона), low_n (sent < 20). Кольори — за викупом, розміри — по порядку. Службове: orders_total і orders_by_class (як у get_funnel_by_product — для звірки), multi_variant_orders (2+ кольори в замовленні — частковий викуп CRM не бачить), unknown_statuses. Рахує на сервері, відповідь — кілька КБ. ДОВГИЙ ПЕРІОД: один виклик гортає до 45 сторінок по 50 замовлень магазину; якщо complete: false — виклич ще раз з тими самими sku/date_from/date_to і cursor = next.cursor. Повний розріз прийде в останньому виклику.',
+    inputSchema: {
+      type:'object',
+      properties:{
+        sku:       { type:'string', description:'Артикул товару (шукається в назві або SKU позиції, як у get_funnel_by_product). Приклад: "21-225"' },
+        date_from: { type:'string', description:'Дата початку YYYY-MM-DD (дата створення замовлення)' },
+        date_to:   { type:'string', description:'Дата кінця YYYY-MM-DD' },
+        cursor:    { type:'string', description:'Лише для продовження довгого періоду: next.cursor з попередньої відповіді, без змін. Перший виклик — без нього.' },
+        max_pages: { type:'number', description:'Скільки сторінок по 50 замовлень гортати за виклик, 1–45 (за замовчуванням 45). Менше — якщо клієнт обриває довгий виклик.' }
       },
       required:['sku','date_from','date_to']
     }
@@ -731,6 +752,7 @@ async function callTool(name, args, apiKey, npKey = '') {
     case 'get_funnel_by_campaign': return getFunnelByCampaign(apiKey, args);
     case 'get_funnel_by_creative': return getFunnelByCreative(apiKey, args);
     case 'get_funnel_by_product':  return getFunnelByProduct(apiKey, args);
+    case 'get_funnel_by_variant':  return getFunnelByVariant(apiKey, args);
     case 'get_product_pl':         return getProductPL(apiKey, args);
     case 'match_returns_to_pending': return matchReturnsToPending(apiKey, args);
     case 'get_period_summary':     return getPeriodSummary(apiKey, args);
@@ -1543,6 +1565,390 @@ async function getFunnelByProduct(apiKey, args) {
       overall_conv_rate: pct(funnel.completed, funnel.total),
     },
     by_campaign: campaigns
+  };
+}
+
+// ─── [НОВЕ v8.4.9] Воронка і викуп по варіантах товару ───
+//
+// НАВІЩО: питання «які кольори й розміри краще замовляють і, головне, краще
+// ЗАБИРАЮТЬ на пошті» не мало інструмента. get_funnel_by_product і get_product_pl
+// ріжуть лише по кампаніях, а тягнути сирі замовлення в модель — ~2 700 токенів
+// за кожен get_order. Тут рахуємо на сервері, назовні — зведення на кілька КБ.
+//
+// ЧОМУ ШТУКИ, А НЕ ЗАМОВЛЕННЯ: в одному замовленні бувають два кольори того самого
+// пальто або дві штуки одного варіанта. Рахуємо позицію × quantity; статус штуки =
+// статус її замовлення. Інші товари в замовленні й апсейли не рахуються.
+//
+// ЧОМУ КУРСОР: фільтра за товаром у GET /order немає (docs.keycrm.app, api.yaml
+// v1.2.0, звірено 16.10.2026: лише status_id, source_id, source_uuid, buyer_phone,
+// buyer_email, created/updated/shipping_between, payment_status, has_tracking_code),
+// тож гортаємо ВСІ замовлення вікна по 50. Безкоштовний Cloudflare дає 50 підзапитів
+// на виклик — get_funnel_by_product на 01.01–16.10.2026 падав «Too many subrequests».
+// Тому один виклик гортає не більше VARIANT_PAGE_BUDGET сторінок, а якщо не встиг —
+// віддає cursor: рядок із проміжними лічильниками і контрольною сумою. Наступний
+// виклик із ним продовжує з тієї ж сторінки; повний підсумок — в останньому.
+// Сортування за id (зростання): нові замовлення падають у кінець вікна і не
+// зсувають уже прочитані сторінки.
+
+// ⟪variant-funnel⟫ чисті функції без запитів — test/variant-funnel.mjs вирізає їх за цією міткою
+const VARIANT_PAGE_BUDGET = 45;   // 50 підзапитів на виклик мінус запас
+const VF_NOT_SET = '(не вказано)';
+const VF_LOW_N = 20;              // менше відправлених — різниці між групами в межах шуму
+const VF_NO_SIZE_STATUS = 29;     // «Не підійшов / Немає розміру» — варіанта не було в наявності
+const VF_MAX_IDS = 10;
+// Ключі розбивки замовлень — ті самі, що в get_funnel_by_product, щоб звіряти один в один.
+const VF_ORDER_KEYS = ['total', 'new', 'in_progress', 'confirmed', 'production',
+                       'delivery', 'completed', 'returned', 'cancelled', 'unknown'];
+// Порядок лічильників штуки — і в пам'яті, і в cursor.
+const VF_UNIT_KEYS = ['ordered', 'cancelled', 'no_size_29', 'pending',
+                      'in_transit', 'completed', 'refused', 'unknown'];
+const VF_SEP = '\u0001';          // колір + VF_SEP + розмір — ключ клітинки
+
+function variantFunnelEmpty() {
+  return {
+    page: 1, last_id: 0, pages: 0, scanned: 0, calls: 0, dup_skipped: 0,
+    orders: Object.fromEntries(VF_ORDER_KEYS.map(k => [k, 0])),
+    unknown_statuses: {},
+    multi_color: 0, multi_color_ids: [], multi_size: 0, no_units: 0,
+    covered_to: null,
+    cells: {},   // 'колір␁розмір' → лічильники в порядку VF_UNIT_KEYS
+  };
+}
+
+// «КОРАЛОВИЙ» і «кораловий» — той самий колір; розміри — великими («xl» → «XL»).
+function vfColor(v) {
+  const s = String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  return s ? s[0].toUpperCase() + s.slice(1) : VF_NOT_SET;
+}
+function vfSize(v) {
+  const s = String(v || '').trim().replace(/\s+/g, ' ').toUpperCase();
+  return s || VF_NOT_SET;
+}
+
+// Буває, що властивості лежать лише в offer.properties (див. test/reserve-holders.mjs).
+function vfProps(p) {
+  return (p.properties && p.properties.length) ? p : { properties: (p.offer && p.offer.properties) || [] };
+}
+
+function vfUnitBucket(cls) {
+  switch (cls) {
+    case 'completed': return 'completed';
+    case 'return':    return 'refused';      // 28 + 32 + 35 — відмова на пошті
+    case 'delivery':  return 'in_transit';   // 9, 20 — ще не закрились
+    case 'cancelled': return 'cancelled';
+    case 'unknown':   return 'unknown';
+    default:          return 'pending';      // новий, погодження, прийнято, виробництво
+  }
+}
+
+// Додає одну сторінку замовлень до лічильників acc. Замовлення має бути
+// з include=products(.offer); товар шукається так само, як у get_funnel_by_product.
+function accumulateVariantFunnel(acc, orders, query) {
+  const q = String(query || '').trim().toLowerCase();
+  const matches = p => (p.sku || '').toLowerCase().includes(q) || (p.name || '').toLowerCase().includes(q);
+
+  // Курсор тримається на тому, що id ростуть. Якщо KeyCRM проігнорував sort=id —
+  // краще впасти на першій сторінці, ніж тихо порахувати не те.
+  for (let i = 1; i < orders.length; i++) {
+    if (!(orders[i].id > orders[i - 1].id)) {
+      throw new Error('KeyCRM віддав сторінку замовлень не за зростанням id — курсор був би ненадійний, нічого не пораховано.');
+    }
+  }
+
+  for (const o of orders) {
+    // Якщо між викликами у вікні з'явилось замовлення, частина вже прочитаних
+    // переїжджає на наступну сторінку. Удруге їх не рахуємо.
+    if (o.id <= acc.last_id) { acc.dup_skipped++; continue; }
+    acc.last_id = o.id;
+    acc.scanned++;
+    if (o.created_at) acc.covered_to = String(o.created_at).slice(0, 10);
+
+    const lines = (o.products || []).filter(matches);
+    if (!lines.length) continue;
+
+    const cls = classifyStatus(o.status_id);
+    acc.orders.total++;
+    acc.orders[cls === 'return' ? 'returned' : cls]++;
+    if (cls === 'unknown') acc.unknown_statuses[o.status_id] = (acc.unknown_statuses[o.status_id] || 0) + 1;
+
+    const at = VF_UNIT_KEYS.indexOf(vfUnitBucket(cls));
+    const noSize = Number(o.status_id) === VF_NO_SIZE_STATUS;
+    const colors = new Set(), sizes = new Set();
+    let units = 0;
+    for (const p of lines) {
+      if (!isBaseProduct(p.name, p.sku)) continue;   // «Преміум …», «Пакування …»
+      const src = vfProps(p);
+      const color = vfColor(variantProp(src, /колір|цвет|color/i));
+      const size  = vfSize(variantProp(src, /розмір|размер|size/i));
+      const qty = Number(p.quantity) > 0 ? Number(p.quantity) : 1;
+      const key = color + VF_SEP + size;
+      const c = acc.cells[key] || (acc.cells[key] = VF_UNIT_KEYS.map(() => 0));
+      c[0] += qty;
+      c[at] += qty;
+      if (noSize) c[2] += qty;
+      units += qty;
+      if (color !== VF_NOT_SET) colors.add(color);
+      if (size !== VF_NOT_SET) sizes.add(size);
+    }
+    if (!units) acc.no_units++;
+    // Частковий викуп (один колір забрали, другий повернули) CRM не бачить:
+    // усе замовлення отримує один статус. Тому такі замовлення лічимо окремо.
+    if (colors.size > 1) {
+      acc.multi_color++;
+      if (acc.multi_color_ids.length < VF_MAX_IDS) acc.multi_color_ids.push(o.id);
+    }
+    if (sizes.size > 1) acc.multi_size++;
+  }
+  return acc;
+}
+
+// 95% інтервал Вілсона для частки k з n. На малих n він чесніший за «±»:
+// не вилазить за 0–100% і не стягується в точку при 0 або n успіхів.
+function vfWilson(k, n) {
+  const z = 1.96, z2 = z * z, p = k / n, den = 1 + z2 / n;
+  const center = (p + z2 / (2 * n)) / den;
+  const half = z * Math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / den;
+  return [Math.max(0, center - half), Math.min(1, center + half)];
+}
+
+function vfAdd(into, c) {
+  const out = into || VF_UNIT_KEYS.map(() => 0);
+  for (let i = 0; i < out.length; i++) out[i] += c[i] || 0;
+  return out;
+}
+
+function vfRate(c) {
+  const sent = c[5] + c[6];
+  return sent ? c[5] / sent : -1;   // -1: нічого не відправлено — в кінець списку
+}
+
+function vfRow(c) {
+  const [ordered, cancelled, no_size_29, pending, in_transit, completed, refused, unknown] = c;
+  const sent = completed + refused;
+  const row = { ordered, cancelled, no_size_29, pending, in_transit, completed, refused, sent,
+                buyout_rate: null, ci95: null, low_n: sent < VF_LOW_N };
+  if (sent) {
+    const [lo, hi] = vfWilson(completed, sent);
+    row.buyout_rate = Math.round(completed / sent * 100) + '%';
+    row.ci95 = `${Math.round(lo * 100)}–${Math.round(hi * 100)}%`;
+  }
+  if (unknown) row.unknown = unknown;
+  return row;
+}
+
+// Клітинка колір×розмір — одним рядком, щоб 24+ клітинки не роздували відповідь.
+function vfCell(c) {
+  const r = vfRow(c);
+  const parts = [`зам ${r.ordered}`];
+  if (r.cancelled)  parts.push(`скас ${r.cancelled}` + (r.no_size_29 ? ` (29: ${r.no_size_29})` : ''));
+  if (r.pending)    parts.push(`чекає ${r.pending}`);
+  if (r.in_transit) parts.push(`дорога ${r.in_transit}`);
+  if (r.unknown)    parts.push(`невідомий статус ${r.unknown}`);
+  parts.push(r.sent
+    ? `викуп ${r.completed}/${r.sent} = ${r.buyout_rate} [${r.ci95}]${r.low_n ? ' мало' : ''}`
+    : 'не відправлялось');
+  return parts.join(' · ');
+}
+
+// Розміри — природним порядком (44-46, 48-50, …): так видно, де саме «не сідає».
+function vfSizeOrder(a, b) {
+  if (a === VF_NOT_SET || b === VF_NOT_SET) return (a === VF_NOT_SET) - (b === VF_NOT_SET);
+  const na = parseFloat(a), nb = parseFloat(b);
+  if (isNaN(na) !== isNaN(nb)) return isNaN(na) ? 1 : -1;
+  if (!isNaN(na) && na !== nb) return na - nb;
+  return a.localeCompare(b, 'uk');
+}
+
+// Кольори — за викупом, потім за кількістю відправлених; «(не вказано)» — останнім.
+function vfColorOrder(a, b) {
+  return (a.name === VF_NOT_SET) - (b.name === VF_NOT_SET)
+    || vfRate(b.c) - vfRate(a.c)
+    || (b.c[5] + b.c[6]) - (a.c[5] + a.c[6])
+    || b.c[0] - a.c[0]
+    || a.name.localeCompare(b.name, 'uk');
+}
+
+function summarizeVariantFunnel(acc) {
+  const byColor = {}, bySize = {};
+  let total = VF_UNIT_KEYS.map(() => 0);
+  for (const [key, c] of Object.entries(acc.cells)) {
+    const [color, size] = key.split(VF_SEP);
+    byColor[color] = vfAdd(byColor[color], c);
+    bySize[size] = vfAdd(bySize[size], c);
+    total = vfAdd(total, c);
+  }
+  const colors = Object.entries(byColor).map(([name, c]) => ({ name, c })).sort(vfColorOrder);
+  const sizes = Object.keys(bySize).sort(vfSizeOrder);
+  const byColorSize = {};
+  for (const { name } of colors) {
+    byColorSize[name] = {};
+    for (const size of sizes) {
+      const c = acc.cells[name + VF_SEP + size];
+      if (c) byColorSize[name][size] = vfCell(c);
+    }
+  }
+  return {
+    total: vfRow(total),
+    by_color: colors.map(({ name, c }) => ({ color: name, ...vfRow(c) })),
+    by_size: sizes.map(size => ({ size, ...vfRow(bySize[size]) })),
+    by_color_size: byColorSize,
+  };
+}
+
+// ── cursor: проміжні лічильники одним рядком ──
+// Формат читабельний (кольори кирилицею, без base64), щоб модель переносила його
+// між викликами без «екранування». Контрольна сума рахується разом із sku і датами:
+// пошкоджений рядок або cursor від іншого запиту — помилка, а не тихо криві числа.
+function vfHash(s) {   // FNV-1a, 32 біти
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, '0');
+}
+const vfEsc = s => String(s).replace(/[%;,~:=]/g, ch => '%' + ch.charCodeAt(0).toString(16).toUpperCase());
+
+function encodeVariantCursor(acc, sku, from, to) {
+  const cells = Object.entries(acc.cells).map(([key, c]) => {
+    const [color, size] = key.split(VF_SEP);
+    return `${vfEsc(color)}~${vfEsc(size)}:${c.join('.')}`;
+  });
+  const body = [
+    'v1',
+    `p=${acc.page}`, `l=${acc.last_id}`, `g=${acc.pages}`, `s=${acc.scanned}`,
+    `k=${acc.calls}`, `d=${acc.dup_skipped}`,
+    `o=${VF_ORDER_KEYS.map(k => acc.orders[k]).join('.')}`,
+    `x=${Object.entries(acc.unknown_statuses).map(([id, n]) => `${id}:${n}`).join(',')}`,
+    `m=${acc.multi_color}`, `mi=${acc.multi_color_ids.join('.')}`,
+    `ms=${acc.multi_size}`, `nu=${acc.no_units}`, `cv=${acc.covered_to || ''}`,
+    `c=${cells.join(',')}`,
+  ].join(';');
+  return `${body};h=${vfHash(`${sku}|${from}|${to}|${body}`)}`;
+}
+
+function decodeVariantCursor(cursor, sku, from, to) {
+  const s = String(cursor || '').trim();
+  const at = s.lastIndexOf(';h=');
+  const fail = why => { throw new Error(`cursor не підходить: ${why}. Почни спочатку без cursor.`); };
+  if (!s.startsWith('v1;') || at < 0) fail('невідомий формат');
+  const body = s.slice(0, at);
+  if (vfHash(`${sku}|${from}|${to}|${body}`) !== s.slice(at + 3)) {
+    fail('рядок пошкоджено або він від інших sku/date_from/date_to');
+  }
+  const f = {};
+  for (const part of body.split(';').slice(1)) {
+    const i = part.indexOf('=');
+    f[part.slice(0, i)] = part.slice(i + 1);
+  }
+  const int = v => parseInt(v, 10) || 0;
+  const acc = variantFunnelEmpty();
+  acc.page = int(f.p) || 1;
+  acc.last_id = int(f.l); acc.pages = int(f.g); acc.scanned = int(f.s);
+  acc.calls = int(f.k); acc.dup_skipped = int(f.d);
+  const ov = (f.o || '').split('.');
+  VF_ORDER_KEYS.forEach((k, i) => { acc.orders[k] = int(ov[i]); });
+  for (const pair of (f.x ? f.x.split(',') : [])) {
+    const [id, n] = pair.split(':');
+    acc.unknown_statuses[id] = int(n);
+  }
+  acc.multi_color = int(f.m);
+  acc.multi_color_ids = f.mi ? f.mi.split('.').map(int) : [];
+  acc.multi_size = int(f.ms); acc.no_units = int(f.nu);
+  acc.covered_to = f.cv || null;
+  for (const cell of (f.c ? f.c.split(',') : [])) {
+    const i = cell.lastIndexOf(':');
+    const [color, size] = cell.slice(0, i).split('~').map(decodeURIComponent);
+    acc.cells[color + VF_SEP + size] = cell.slice(i + 1).split('.').map(int);
+  }
+  return acc;
+}
+// ⟪/variant-funnel⟫
+
+async function getFunnelByVariant(apiKey, args = {}) {
+  const sku = String(args.sku || '').trim();
+  const { date_from, date_to, cursor } = args;
+  const isDate = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''));
+  if (!sku) throw new Error('Передай sku — артикул товару, напр. "21-225"');
+  if (!isDate(date_from) || !isDate(date_to)) throw new Error('date_from і date_to — у форматі YYYY-MM-DD');
+  const budget = Math.min(Math.max(parseInt(args.max_pages, 10) || VARIANT_PAGE_BUDGET, 1), VARIANT_PAGE_BUDGET);
+
+  const acc = cursor ? decodeVariantCursor(cursor, sku, date_from, date_to) : variantFunnelEmpty();
+  acc.calls++;
+  const params = {
+    'filter[created_between]': `${date_from} 00:00:00, ${date_to} 23:59:59`,
+    include: 'products.offer', sort: 'id', limit: 50,
+  };
+
+  // Послідовно, не Promise.all: ліміт KeyCRM спільний із лендінгами.
+  const started = Date.now();
+  let used = 0, done = false, lastPage = null, stopped = null;
+  while (used < budget) {
+    let data;
+    try {
+      data = await keycrmGet(apiKey, '/order', { ...params, page: acc.page });
+    } catch (e) {
+      // У цьому виклику ще нічого не прочитано — віддаємо помилку як є:
+      // cursor, з яким прийшли, лишається дійсним.
+      if (used === 0) throw new Error(e.message + (cursor ? ' (cursor лишається дійсним — повтори виклик із ним)' : ''));
+      stopped = e.message;   // напр. 429 від KeyCRM: прочитане не губимо, віддаємо cursor
+      break;
+    }
+    used++;
+    const batch = data.data || [];
+    accumulateVariantFunnel(acc, batch, sku);
+    acc.pages++;
+    lastPage = data.last_page || 1;
+    if (batch.length === 0 || acc.page >= lastPage) { done = true; break; }
+    acc.page++;
+  }
+
+  const { total: _t, ...byClass } = acc.orders;
+  const head = {
+    sku,
+    date_range: { from: date_from, to: date_to },
+    complete: done,
+    scan: { calls: acc.calls, pages: acc.pages, orders_scanned: acc.scanned,
+            this_call: { pages: used, seconds: Math.round((Date.now() - started) / 1000) } },
+    orders_total: acc.orders.total,
+    orders_by_class: byClass,
+  };
+
+  if (!done) {
+    const pagesLeft = Math.max(lastPage - acc.page + 1, 0);
+    return {
+      ...head,
+      covered_to: acc.covered_to,
+      total_so_far: summarizeVariantFunnel(acc).total,
+      ...(stopped ? { stopped_reason: stopped } : {}),
+      next: {
+        cursor: encodeVariantCursor(acc, sku, date_from, date_to),
+        pages_left: pagesLeft,
+        calls_left_estimate: Math.ceil(pagesLeft / VARIANT_PAGE_BUDGET),
+        how: 'Виклич get_funnel_by_variant ще раз з тими самими sku, date_from, date_to і cursor = next.cursor (рядок без змін). ' +
+             'Розріз по кольорах і розмірах прийде в останньому виклику (complete: true). covered_to — до якої дати створення вже пораховано.',
+      },
+    };
+  }
+
+  const s = summarizeVariantFunnel(acc);
+  return {
+    ...head,
+    unknown_statuses: acc.unknown_statuses,
+    multi_variant_orders: acc.multi_color,
+    ...(acc.multi_color_ids.length ? { multi_variant_order_ids: acc.multi_color_ids } : {}),
+    multi_size_orders: acc.multi_size,
+    ...(acc.no_units ? { orders_without_units: acc.no_units } : {}),
+    ...(acc.dup_skipped ? { dup_skipped: acc.dup_skipped } : {}),
+    total: s.total,
+    by_color: s.by_color,
+    by_size: s.by_size,
+    by_color_size: s.by_color_size,
+    note: 'Одиниця — штука (позиція × кількість), лише позиції цього товару без апсейлів; статус штуки = статус замовлення. ' +
+          'buyout_rate = completed ÷ (completed + refused) — забір на пошті; refused = відмови на пошті 28+32+35; ' +
+          'in_transit (9, 20) ще не закрились і у викуп не входять. Свіжий період завищує викуп: викуп стається за 1–2 дні, ' +
+          'відмова — лише після терміну зберігання. ci95 — інтервал Вілсона; low_n: sent < 20 — різниці в межах інтервалів не значущі. ' +
+          'no_size_29 — скасовано зі статусом 29 «Не підійшов / Немає розміру». pending — ще до відправки (новий, погодження, прийнято, виробництво). ' +
+          'multi_variant_orders — замовлення з 2+ кольорами (multi_size_orders — з 2+ розмірами): частковий викуп CRM не бачить, усі штуки отримують статус замовлення. ' +
+          'orders_by_class — у ключах get_funnel_by_product, для звірки. ' +
+          'by_color_size: «зам · скас (29: …) · чекає · дорога · викуп виконано/відправлено = % [ci95] мало».',
   };
 }
 

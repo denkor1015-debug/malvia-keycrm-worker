@@ -2,6 +2,11 @@
 // KeyCRM MCP Server для Cloudflare Workers
 // Версія 8.4 — закрито відкритий ендпоінт.
 //
+// v8.4.11 (тільки додано):
+//   [НОВЕ] виробник Тимофеева (з 27.10.2026; категорія KeyCRM 10, тег Timofeeva):
+//          у MANUFACTURER_TAGS (get_period_summary) і CATEGORY_TAG (create_order),
+//          так само, як Бонаеми у v8.4.10.
+//
 // v8.4.10 (тільки додано):
 //   [НОВЕ] виробник Бонаеми (з 23.10.2026; категорія KeyCRM 9, тег BM):
 //          у MANUFACTURER_TAGS (get_period_summary) і CATEGORY_TAG (create_order),
@@ -89,7 +94,7 @@ export default {
     if (request.method === 'OPTIONS') return corsResponse(null, 204);
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/') {
-      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.10 running ✓' }), 200);
+      return corsResponse(JSON.stringify({ status: 'KeyCRM MCP Server v8.4.11 running ✓' }), 200);
     }
     // /mcp або /mcp/<секрет> — друге для клієнтів, де можна задати лише URL.
     if (request.method === 'POST' && (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/'))) {
@@ -220,7 +225,7 @@ async function handleMessage(message, env) {
         return { jsonrpc:'2.0', id, result:{
           protocolVersion:'2024-11-05',
           capabilities:{tools:{}},
-          serverInfo:{name:'keycrm-mcp',version:'8.4.10'}
+          serverInfo:{name:'keycrm-mcp',version:'8.4.11'}
         }};
       case 'notifications/initialized': return null;
       case 'ping': return { jsonrpc:'2.0', id, result:{} };
@@ -475,7 +480,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        category_id: { type: 'number', description: 'ID категорії (опціонально). Seven=3, Lotran=6, Minova=2, KORA=1, MaxiFashion=7, Люда-Лёня=8, Бонаеми (тег BM)=9' },
+        category_id: { type: 'number', description: 'ID категорії (опціонально). Seven=3, Lotran=6, Minova=2, KORA=1, MaxiFashion=7, Люда-Лёня=8, Бонаеми (тег BM)=9, Тимофеева (тег Timofeeva)=10' },
         query: { type: 'string', description: 'Пошук по назві або SKU (опціонально)' },
         is_archived: { type: 'string', description: 'Фільтр архівних: "true" або "false" (опціонально)' },
         include_custom_fields: { type: 'boolean', description: 'Підключити користувацькі поля товару' },
@@ -694,7 +699,7 @@ const TOOLS = [
   },
   {
     name: 'get_period_summary',
-    description: 'Товарний підсумок періоду для фінансового закриття: виручка за типами (товар / Преміум / пакування), одиниці по виробниках і кількість по кожному артикулу. Замінює ручну вигрузку CRM у шаблон «Подсчеты». Уся агрегація — ВСЕРЕДИНІ воркера, повертає компактний підсумок, а не сирі замовлення. ЯК КОРИСТУВАТИСЬ: передай ttns — масив ТТН із реєстру NovaPay за період; це дає ТОЧНЕ зіставлення «гроші ↔ товар», бо гривня належить місяцю свого реєстру, а не дати замовлення. Без ttns фільтрує за датою створення — це наближення, придатне для оцінки, але не для закриття місяця. Виробник береться лише з відомих тегів (KORA / Minova / Seven / MaxiFashion / Люда-Лёня / BM / Lotran); сторонні теги на кшталт РОЗПРОДАЖ ігноруються.',
+    description: 'Товарний підсумок періоду для фінансового закриття: виручка за типами (товар / Преміум / пакування), одиниці по виробниках і кількість по кожному артикулу. Замінює ручну вигрузку CRM у шаблон «Подсчеты». Уся агрегація — ВСЕРЕДИНІ воркера, повертає компактний підсумок, а не сирі замовлення. ЯК КОРИСТУВАТИСЬ: передай ttns — масив ТТН із реєстру NovaPay за період; це дає ТОЧНЕ зіставлення «гроші ↔ товар», бо гривня належить місяцю свого реєстру, а не дати замовлення. Без ttns фільтрує за датою створення — це наближення, придатне для оцінки, але не для закриття місяця. Виробник береться лише з відомих тегів (KORA / Minova / Seven / MaxiFashion / Люда-Лёня / BM / Timofeeva / Lotran); сторонні теги на кшталт РОЗПРОДАЖ ігноруються.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -940,7 +945,7 @@ async function getAllOrdersWithProducts(apiKey, params) {
 // ЧОМУ АГРЕГАЦІЯ ТУТ, А НЕ В МОДЕЛІ: 500+ замовлень сирими картками — це
 // сотні тисяч токенів. Тут виходить компактний підсумок на кілька кілобайт.
 
-const MANUFACTURER_TAGS = ['KORA', 'Minova', 'Seven', 'MaxiFashion', 'Люда-Лёня', 'BM', 'Lotran'];
+const MANUFACTURER_TAGS = ['KORA', 'Minova', 'Seven', 'MaxiFashion', 'Люда-Лёня', 'BM', 'Timofeeva', 'Lotran'];
 const PACKAGING_MARK = 'пакуванн';   // у CRM назва з опискою: «пакуванняя»
 const PREMIUM_MARK   = 'преміум';
 
@@ -2953,7 +2958,7 @@ async function createOrder(apiKey, args, npKey = '') {
           catId = prod?.category_id;
         } catch (e) {}
       }
-      const CATEGORY_TAG = { 1: 'KORA', 2: 'Minova', 3: 'Seven', 6: 'Lotran', 7: 'MaxiFashion', 8: 'Люда-Лёня', 9: 'BM' };
+      const CATEGORY_TAG = { 1: 'KORA', 2: 'Minova', 3: 'Seven', 6: 'Lotran', 7: 'MaxiFashion', 8: 'Люда-Лёня', 9: 'BM', 10: 'Timofeeva' };
       if (catId && CATEGORY_TAG[catId]) extractedTags.push(CATEGORY_TAG[catId]);
 
       // 2) Запасне: пошук назви виробника в тексті картки
